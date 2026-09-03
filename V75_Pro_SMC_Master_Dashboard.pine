@@ -1,0 +1,377 @@
+//@version=6
+indicator("V75 Pro SMC Master Dashboard - Multi Asset Presets V12.0", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// =============================================================================
+// ==================== PART 0: ASSET PRESET SELECTOR =======================
+// =============================================================================
+
+asset_preset = input.string("NASDAQ", title="Select Asset Class", options=["NASDAQ", "Gold", "Forex", "Crypto", "Custom"], group="⚙️ ASSET PRESETS")
+
+// --- AUTO-LOAD PRESETS BASED ON SELECTION ---
+f_get_preset_values(string asset) =>
+    if asset == "Gold"
+        fvg_sens = 0.8
+        lb = 12
+        ob_col = color.new(#FFD700, 85)
+        fvg_col = color.new(#FFA500, 90)
+        [fvg_sens, lb, ob_col, fvg_col]
+    else if asset == "NASDAQ"
+        fvg_sens = 1.0
+        lb = 10
+        ob_col = color.new(color.blue, 85)
+        fvg_col = color.new(color.orange, 90)
+        [fvg_sens, lb, ob_col, fvg_col]
+    else if asset == "Forex"
+        fvg_sens = 0.7
+        lb = 15
+        ob_col = color.new(#4169E1, 85)
+        fvg_col = color.new(#FF6347, 90)
+        [fvg_sens, lb, ob_col, fvg_col]
+    else if asset == "Crypto"
+        fvg_sens = 1.8
+        lb = 12
+        ob_col = color.new(#9370DB, 85)
+        fvg_col = color.new(#00CED1, 90)
+        [fvg_sens, lb, ob_col, fvg_col]
+    else
+        fvg_sens = 1.0
+        lb = 10
+        ob_col = color.new(color.blue, 85)
+        fvg_col = color.new(color.orange, 90)
+        [fvg_sens, lb, ob_col, fvg_col]
+
+[preset_fvg, preset_lb, preset_ob_col, preset_fvg_col] = f_get_preset_values(asset_preset)
+
+// =============================================================================
+// ==================== PART 1: CORE ENGINE & PARAMETERS =======================
+// =============================================================================
+
+// --- User Inputs & Settings ---
+show_dashboard = input.bool(true, title="Show Master Dashboard Table", group="UI Layout")
+dash_pos       = input.string("Top Right", title="Dashboard Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group="UI Layout")
+text_sz_input  = input.string("Small", title="Dashboard Text Size", options=["Small", "Medium", "Large"], group="UI Layout")
+
+// VISUAL TOGGLE CONTROLS
+show_ob_zones  = input.bool(true, title="Show On-Chart Order Blocks (OB)", group="SMC Style Controls")
+show_bos_lines = input.bool(true, title="Show On-Chart Breaks of Structure (BOS / CHoCH)", group="SMC Style Controls")
+show_fvg_zones = input.bool(true, title="Show On-Chart Macro Imbalances (FVG)", group="SMC Style Controls")
+show_idm_lines = input.bool(true, title="Show On-Chart Inducement / Retail Money Traps", group="SMC Style Controls")
+
+// SENSITIVITY CONTROLS - NOW PRESET-AWARE
+use_preset = input.bool(true, title="Use Asset Preset Values", group="SMC Parameters")
+fvg_sensitive  = use_preset ? preset_fvg : input.float(1.0, title="FVG Body Sensitivity Multiplier", minval=0.0, maxval=3.0, group="SMC Parameters")
+lookback       = use_preset ? preset_lb : input.int(10, title="Structure Lookback Period", minval=2, group="SMC Parameters")
+
+// MITIGATION CONTROLS
+mit_type       = input.string("Body Close", title="Mitigation Trigger Type", options=["Wick Touch", "Body Close"], group="SMC Style Controls")
+mit_style      = input.string("Change Color", title="Mitigation Handling Mode", options=["Change Color", "Completely Delete"], group="SMC Style Controls")
+
+ob_color       = use_preset ? preset_ob_col : input.color(color.new(color.blue, 85), title="Order Block Fill Color", group="SMC Parameters")
+ob_border      = input.color(color.blue, title="Order Block Border Color", group="SMC Parameters")
+fvg_color      = use_preset ? preset_fvg_col : input.color(color.new(color.orange, 90), title="Imbalance Fill Color", group="SMC Parameters")
+idm_color      = input.color(#ff00ff, title="Trap Line/Text Color Changer", group="SMC Parameters")
+
+// INDEPENDENT STRUCTURAL BREAK COLORS
+bull_structure_color = input.color(color.green, title="Bullish BOS/CHoCH Color", group="SMC Parameters")
+bear_structure_color = input.color(color.red, title="Bearish BOS/CHoCH Color", group="SMC Parameters")
+
+// CUSTOM PARAMETERS
+ob_mit_color   = input.color(color.new(color.gray, 95), title="Mitigated OB Color", group="SMC Custom Colors")
+fvg_mit_color  = input.color(color.new(color.purple, 95), title="Mitigated Imbalance Color", group="SMC Custom Colors")
+
+// --- Multi-Zone Persistent Queue Arrays ---
+// NOTE: each box/line array now also tracks a parallel "mitigated" boolean array so that
+// mitigated-but-still-visible ("Change Color") objects stay under the size-based cleanup
+// in manage_queue()/manage_lines() instead of leaking out of management forever (see Part 3).
+var box[] bull_ob_boxes   = array.new_box()
+var bool[] bull_ob_mit    = array.new_bool()
+var box[] bear_ob_boxes   = array.new_box()
+var bool[] bear_ob_mit    = array.new_bool()
+var box[] bull_fvg_boxes  = array.new_box()
+var bool[] bull_fvg_mit   = array.new_bool()
+var box[] bear_fvg_boxes  = array.new_box()
+var bool[] bear_fvg_mit   = array.new_bool()
+var box[] idm_boxes       = array.new_box()
+var line[] structural_ln  = array.new_line()
+var label[] structural_lb = array.new_label()
+
+// =============================================================================
+// ==================== PART 2: STRUCTURE RUN CALCULATIONS =====================
+// =============================================================================
+
+manage_queue(box[] arr, bool[] mit_arr, box new_box) =>
+    if not na(new_box)
+        array.push(arr, new_box)
+        array.push(mit_arr, false)
+        if array.size(arr) > 20
+            box.delete(array.shift(arr))
+            array.shift(mit_arr)
+
+manage_lines(line[] arr, line new_ln) =>
+    if not na(new_ln)
+        array.push(arr, new_ln)
+        if array.size(arr) > 25
+            line.delete(array.shift(arr))
+
+manage_labels(label[] arr, label new_lbl) =>
+    if not na(new_lbl)
+        array.push(arr, new_lbl)
+        if array.size(arr) > 25
+            label.delete(array.shift(arr))
+
+var int hi_bar   = 0
+var int lo_bar   = 0
+var float hi_val = na
+var float lo_val = na
+var int last_dir = 0 
+
+is_swing_hi = ta.pivothigh(high, lookback, lookback)
+is_swing_lo = ta.pivotlow(low, lookback, lookback)
+
+if not na(is_swing_hi)
+    hi_val := is_swing_hi
+    hi_bar := bar_index - lookback
+
+if not na(is_swing_lo)
+    lo_val := is_swing_lo
+    lo_bar := bar_index - lookback
+
+bool bos_bull = ta.crossover(close, hi_val)
+bool bos_bear = ta.crossunder(close, lo_val)
+
+// Structural break lines/labels are drawn WITHOUT extend so they get a real, fixed end point
+// at the bar where the break was confirmed instead of stretching to the right edge forever.
+if bos_bull and not na(hi_val)
+    if show_bos_lines
+        string label_text = last_dir == -1 ? "CHoCH" : "BOS"
+        int center_x = math.round((hi_bar + bar_index) / 2)
+        line ln = line.new(x1=hi_bar, y1=hi_val, x2=bar_index, y2=hi_val, color=bull_structure_color, style=line.style_dashed, width=1, extend=extend.none)
+        label lb = label.new(x=center_x, y=hi_val, text=label_text, color=color.new(color.black, 100), textcolor=bull_structure_color, style=label.style_label_down, size=size.small)
+        manage_lines(structural_ln, ln)
+        manage_labels(structural_lb, lb)
+    last_dir := 1
+
+if bos_bear and not na(lo_val)
+    if show_bos_lines
+        string label_text = last_dir == 1 ? "CHoCH" : "BOS"
+        int center_x = math.round((lo_bar + bar_index) / 2)
+        line ln = line.new(x1=lo_bar, y1=lo_val, x2=bar_index, y2=lo_val, color=bear_structure_color, style=line.style_dashed, width=1, extend=extend.none)
+        label lb = label.new(x=center_x, y=lo_val, text=label_text, color=color.new(color.black, 100), textcolor=bear_structure_color, style=label.style_label_up, size=size.small)
+        manage_lines(structural_ln, ln)
+        manage_labels(structural_lb, lb)
+    last_dir := -1
+
+// Order Block boxes are created without extend; Part 3 grows `right` by one bar at a time
+// until the box is mitigated, at which point it gets frozen at its current width.
+if bos_bull and not na(lo_val)
+    if show_ob_zones
+        box b = box.new(left=lo_bar, top=high[bar_index - lo_bar], right=bar_index, bottom=lo_val, bgcolor=ob_color, border_color=ob_border, border_style=line.style_dashed, text="Bullish OB", text_color=color.green, text_size=size.small, text_valign="center", text_halign="center", extend=extend.none)
+        manage_queue(bull_ob_boxes, bull_ob_mit, b)
+    hi_val := na 
+
+if bos_bear and not na(hi_val)
+    if show_ob_zones
+        box b = box.new(left=hi_bar, top=hi_val, right=bar_index, bottom=low[bar_index - hi_bar], bgcolor=ob_color, border_color=ob_border, border_style=line.style_dashed, text="Bearish OB", text_color=color.red, text_size=size.small, text_valign="center", text_halign="center", extend=extend.none)
+        manage_queue(bear_ob_boxes, bear_ob_mit, b)
+    lo_val := na 
+
+minor_hi = ta.pivothigh(high, 3, 3)
+minor_lo = ta.pivotlow(low, 3, 3)
+
+if not na(minor_hi) and show_idm_lines
+    box b = box.new(left=bar_index-5, top=minor_hi, right=bar_index, bottom=minor_hi, border_color=idm_color, border_style=line.style_dashed, bgcolor=color.new(idm_color, 100), text="Trap", text_color=idm_color, text_size=size.small, text_valign="top", text_halign="center", extend=extend.none)
+    array.push(idm_boxes, b)
+    if array.size(idm_boxes) > 20
+        box.delete(array.shift(idm_boxes))
+
+if not na(minor_lo) and show_idm_lines
+    box b = box.new(left=bar_index-5, top=minor_lo, right=bar_index, bottom=minor_lo, border_color=idm_color, border_style=line.style_dashed, bgcolor=color.new(idm_color, 100), text="Trap", text_color=idm_color, text_size=size.small, text_valign="top", text_halign="center", extend=extend.none)
+    array.push(idm_boxes, b)
+    if array.size(idm_boxes) > 20
+        box.delete(array.shift(idm_boxes))
+
+// --- FVG (Fair Value Gap) detection -----------------------------------------
+// A Fair Value Gap is a genuine 3-candle imbalance: the wick of the candle two bars back
+// does not overlap the wick of the current candle, leaving a "gap" that the middle candle's
+// displacement created. The previous version tried to detect this on a SINGLE candle via
+// `low > open`, which can never be true for a normal candle (low is always <= open), so FVGs
+// were essentially never drawn. This restores the standard 3-bar comparison and keeps the
+// displacement filter as an additional strength/quality gate on the middle (displacement) candle.
+candle_range = high - low
+avg_range = ta.sma(candle_range, 20)
+bool is_displaced = (math.abs(close[1] - open[1]) > (avg_range * fvg_sensitive))
+
+bool fvg_bull = is_displaced and low > high[2]
+bool fvg_bear = is_displaced and high < low[2]
+
+if fvg_bull and show_fvg_zones
+    box b = box.new(left=bar_index-2, top=low, right=bar_index, bottom=high[2], bgcolor=fvg_color, border_color=color.new(color.orange, 40), text="Bullish FVG", text_color=color.orange, text_size=size.small, text_valign="center", text_halign="center", extend=extend.none)
+    manage_queue(bull_fvg_boxes, bull_fvg_mit, b)
+
+if fvg_bear and show_fvg_zones
+    box b = box.new(left=bar_index-2, top=low[2], right=bar_index, bottom=high, bgcolor=fvg_color, border_color=color.new(color.orange, 40), text="Bearish FVG", text_color=color.orange, text_size=size.small, text_valign="center", text_halign="center", extend=extend.none)
+    manage_queue(bear_fvg_boxes, bear_fvg_mit, b)
+
+// =============================================================================
+// ==================== PART 3: EXTENSIONS & UI GENERATION =====================
+// =============================================================================
+
+// Boxes are created with extend=extend.none. Every bar, unmitigated boxes get their right
+// edge pushed forward to bar_index (so they visually track price as "still active" zones).
+// Once a box is mitigated it is frozen (right edge stops moving) but — unlike before — it
+// stays in its tracking array (marked mitigated) so it remains subject to the 20-item cap
+// in manage_queue() instead of leaking out of management and living forever on the chart.
+handle_mitigation(box[] boxes, bool[] mit_arr, bool is_bullish, color target_m_color) =>
+    if array.size(boxes) > 0
+        for i = array.size(boxes) - 1 to 0
+            box current_box = array.get(boxes, i)
+            bool already_mitigated = array.get(mit_arr, i)
+            if not already_mitigated
+                float b_top    = box.get_top(current_box)
+                float b_bottom = box.get_bottom(current_box)
+
+                float check_val_bull = mit_type == "Wick Touch" ? low : math.min(open, close)
+                float check_val_bear = mit_type == "Wick Touch" ? high : math.max(open, close)
+
+                bool mitigated = is_bullish ? (check_val_bull <= b_top) : (check_val_bear >= b_bottom)
+
+                if mitigated
+                    if mit_style == "Completely Delete"
+                        box.delete(current_box)
+                        array.remove(boxes, i)
+                        array.remove(mit_arr, i)
+                    else
+                        box.set_bgcolor(current_box, target_m_color)
+                        box.set_border_color(current_box, color.new(target_m_color, 40))
+                        box.set_right(current_box, bar_index)
+                        array.set(mit_arr, i, true)
+                else
+                    box.set_right(current_box, bar_index)
+    int(na)
+
+handle_idm_extension(box[] boxes) =>
+    if array.size(boxes) > 0
+        for i = array.size(boxes) - 1 to 0
+            box current_box = array.get(boxes, i)
+            float level = box.get_top(current_box)
+            bool broken = (low <= level and high >= level)
+            if broken
+                box.delete(current_box)
+                array.remove(boxes, i)
+            else
+                box.set_right(current_box, bar_index)
+    int(na)
+
+handle_mitigation(bull_ob_boxes, bull_ob_mit, true, ob_mit_color)
+handle_mitigation(bear_ob_boxes, bear_ob_mit, false, ob_mit_color)
+handle_mitigation(bull_fvg_boxes, bull_fvg_mit, true, fvg_mit_color)
+handle_mitigation(bear_fvg_boxes, bear_fvg_mit, false, fvg_mit_color)
+handle_idm_extension(idm_boxes)
+
+calc_stateless_structure() =>
+    swing_state  = close >= ta.highest(high, 30) ? 1 : (close <= ta.lowest(low, 30) ? -1 : (close >= ta.highest(high, 50) ? 1 : -1))
+    intern_state = close >= ta.highest(high, 10) ? 1 : (close <= ta.lowest(low, 10) ? -1 : (close >= ta.highest(high, 15) ? 1 : -1))
+    [swing_state, intern_state]
+
+// ADAPTIVE ASSET SYNC: Explicitly links ticker stream requests to system core properties
+// NOTE: These multi-timeframe SWING/INTERNAL readings are a deliberately separate,
+// stateless range-position heuristic from the main-timeframe pivot-based BOS/CHoCH state
+// (`bos_bull`/`bos_bear`) used for the on-chart OB/structure drawings below. They are not
+// meant to be numerically identical: SWING/INTERNAL summarize higher-timeframe positioning,
+// while "3. Structural Break (BOS)" reflects the current chart's most recent pivot break.
+// Expect them to disagree at times; that is by design, not a bug to "fix" by merging them.
+[m5_s, m5_i]   = request.security(syminfo.tickerid, "5", calc_stateless_structure())
+[m15_s, m15_i] = request.security(syminfo.tickerid, "15", calc_stateless_structure())
+[h1_s, h1_i]   = request.security(syminfo.tickerid, "60", calc_stateless_structure())
+[h4_s, h4_i]   = request.security(syminfo.tickerid, "240", calc_stateless_structure())
+[d_s, d_i]     = request.security(syminfo.tickerid, "D", calc_stateless_structure())
+
+t_pos = dash_pos == "Top Right" ? position.top_right : dash_pos == "Bottom Right" ? position.bottom_right : dash_pos == "Top Left" ? position.top_left : position.bottom_left
+string final_sz = text_sz_input == "Large" ? size.large : text_sz_input == "Medium" ? size.normal : size.small
+
+var table master_dash = table.new(position=t_pos, columns=4, rows=13, bgcolor=color.new(#131722, 10), border_color=color.new(color.gray, 50), border_width=1)
+
+print_cell(table tbl, int col, int row, string cell_text, color bg, color fg, string align_type, string text_size_prop) =>
+    h_align = align_type == "left" ? text.align_left : text.align_center
+    table.cell(tbl, col, row, cell_text, bgcolor=bg, text_color=fg, text_size=text_size_prop, text_halign=h_align, text_valign=text.align_center)
+
+parse_row(table tbl, int row, string tf_label, int swing_state, int internal_state, string ts) =>
+    string swing_txt = swing_state > 0 ? "BULLISH" : "BEARISH"
+    color swing_bg   = swing_state > 0 ? color.new(#0b6623, 10) : color.new(#b22222, 10)
+    string int_txt   = internal_state > 0 ? "BULLISH" : "BEARISH"
+    color int_bg     = internal_state > 0 ? color.new(#0b6623, 10) : color.new(#b22222, 10)
+    string trade_txt = ""
+    color trade_bg   = color.gray
+    if swing_state > 0
+        trade_txt := internal_state > 0 ? "BUY VALID" : "BUY COUNTER"
+        trade_bg  := internal_state > 0 ? color.new(#0b6623, 10) : color.new(#b22222, 10)
+    else
+        trade_txt := internal_state < 0 ? "SELL VALID" : "SELL COUNTER"
+        trade_bg  := internal_state < 0 ? color.new(#b22222, 10) : color.new(#b22222, 10)
+    print_cell(tbl, 0, row, tf_label, color.new(color.gray, 20), color.white, "center", ts)
+    print_cell(tbl, 1, row, swing_txt, swing_bg, color.white, "center", ts)
+    print_cell(tbl, 2, row, int_txt, int_bg, color.white, "center", ts)
+    print_cell(tbl, 3, row, trade_txt, trade_bg, color.white, "center", ts)
+
+var string bias_text = "MARKET CONSOLIDATING - WAIT"
+var color bias_bg    = color.gray
+var color bias_fg    = color.white
+bool macro_bear = (h1_s < 0 and h4_s < 0)
+bool macro_bull = (h1_s > 0 and h4_s > 0)
+bool entry_bear = (m5_s < 0 or m15_s < 0)
+bool entry_bull = (m5_s > 0 or m15_s > 0)
+
+if macro_bear and entry_bear
+    bias_text := "🚨 LOOK FOR SELLS NOW 🚨"
+    bias_bg    := color.new(#b22222, 10)
+else if macro_bull and entry_bull
+    bias_text := "🔥 LOOK FOR BUYS NOW 🔥"
+    bias_bg    := color.new(#0b6623, 10)
+else
+    bias_text := "MARKET CONSOLIDATING - WAIT"
+    bias_bg    := color.new(color.gray, 20)
+
+if barstate.islast and show_dashboard
+    // Display active preset
+    preset_display = use_preset ? asset_preset : "CUSTOM"
+    print_cell(master_dash, 0, 0, "📊 PRESET: " + preset_display, color.new(color.purple, 30), color.white, "left", final_sz)
+    table.merge_cells(master_dash, 0, 0, 3, 0)
+    
+    print_cell(master_dash, 0, 1, "TF", color.new(color.black, 40), color.gray, "center", final_sz)
+    print_cell(master_dash, 1, 1, "SWING", color.new(color.black, 40), color.white, "center", final_sz)
+    print_cell(master_dash, 2, 1, "INTERNAL", color.new(color.black, 40), color.white, "center", final_sz)
+    print_cell(master_dash, 3, 1, "TRADE", color.new(color.black, 40), color.white, "center", final_sz)
+    parse_row(master_dash, 2, "5M", m5_s, m5_i, final_sz)
+    parse_row(master_dash, 3, "15M", m15_s, m15_i, final_sz)
+    parse_row(master_dash, 4, "1H", h1_s, h1_i, final_sz)
+    parse_row(master_dash, 5, "4H", h4_s, h4_i, final_sz)
+    parse_row(master_dash, 6, "D", d_s, d_i, final_sz)
+    table.cell(master_dash, 0, 7, "4-STEP SMC STRATEGY CHECKLIST VERSION 12.0", bgcolor=color.new(color.blue, 30), text_color=color.white, text_size=final_sz, text_halign=text.align_center, text_valign=text.align_center)
+    table.merge_cells(master_dash, 0, 7, 3, 7)
+    trend_txt = close > ta.highest(high, 50) ? "BULLISH" : "BEARISH"
+    trend_bg  = trend_txt == "BULLISH" ? color.new(#0b6623, 10) : color.new(#b22222, 10)
+    print_cell(master_dash, 0, 8, "1. HTF Orderflow Status", color.new(color.navy, 30), color.white, "left", final_sz)
+    table.merge_cells(master_dash, 0, 8, 1, 8)
+    print_cell(master_dash, 2, 8, trend_txt, trend_bg, color.white, "center", final_sz)
+    print_cell(master_dash, 3, 8, "Structure Locked", color.new(color.navy, 50), color.gray, "center", final_sz)
+    liq_status = (ta.highest(high, 5) == ta.highest(high, 15)) ? "EQH Pool Found" : "Scanning Pools"
+    liq_bg     = liq_status == "EQH Pool Found" ? color.new(color.orange, 20) : color.new(color.gray, 40)
+    print_cell(master_dash, 0, 9, "2. Liquidity Pool Map", color.new(color.navy, 30), color.white, "left", final_sz)
+    table.merge_cells(master_dash, 0, 9, 1, 9)
+    print_cell(master_dash, 2, 9, liq_status, liq_bg, color.white, "center", final_sz)
+    print_cell(master_dash, 3, 9, "EQH / EQL Level", color.new(color.navy, 50), color.gray, "center", final_sz)
+    struct_txt = bos_bull ? "BULLISH BOS" : bos_bear ? "BEARISH BOS" : "Holding Zone"
+    struct_bg  = bos_bull ? color.new(#0b6623, 10) : bos_bear ? color.new(#b22222, 10) : color.new(color.gray, 40)
+    print_cell(master_dash, 0, 10, "3. Structural Break (BOS)", color.new(color.navy, 30), color.white, "left", final_sz)
+    table.merge_cells(master_dash, 0, 10, 1, 10)
+    print_cell(master_dash, 2, 10, struct_txt, struct_bg, color.white, "center", final_sz)
+    print_cell(master_dash, 3, 10, "Pivot Breaks", color.new(color.navy, 50), color.gray, "center", final_sz)
+    in_fvg = (low < ta.highest(high, 3) and high > ta.lowest(low, 3))
+    mit_txt = fvg_bull or fvg_bear or in_fvg ? "ZONE TAP ACTIVE" : "Waiting for Tap"
+    mit_bg  = mit_txt == "ZONE TAP ACTIVE" ? color.new(color.teal, 10) : color.new(color.gray, 40)
+    print_cell(master_dash, 0, 11, "4. Precision Entry Area", color.new(color.navy, 30), color.white, "left", final_sz)
+    table.merge_cells(master_dash, 0, 11, 1, 11)
+    print_cell(master_dash, 2, 11, mit_txt, mit_bg, color.white, "center", final_sz)
+    print_cell(master_dash, 3, 11, "FVG Mitigation", color.new(color.navy, 50), color.gray, "center", final_sz)
+    table.cell(master_dash, 0, 12, bias_text, bgcolor=bias_bg, text_color=bias_fg, text_size=final_sz, text_halign=text.align_center, text_valign=text.align_center)
+    table.merge_cells(master_dash, 0, 12, 3, 12)
